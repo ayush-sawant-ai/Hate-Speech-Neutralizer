@@ -1,0 +1,14 @@
+Input text
+    ↓
+Embedding (20,000 × 128)
+    ↓
+LSTM (128)
+    ↓
+Dropout
+    ↓
+Dense (64, ReLU)
+    ↓
+Dense (1, Sigmoid)
+    ↓
+Toxic / Non-toxic
+
