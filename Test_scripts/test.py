@@ -53,7 +53,7 @@ from tensorflow.keras.models import load_model
 from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
 
 # Load test data
-with open("data/test_data.pkl", "rb") as f:
+with open(r"E:\SEM5\DipLerning\DL_Project\HateSpeechDetection\data\test_data.pkl", "rb") as f:
     X_test, y_test = pickle.load(f)
 
 
@@ -82,7 +82,7 @@ from sklearn.metrics import classification_report, confusion_matrix
 import numpy as np
 
 # Load final GRU
-model = load_model("models/gru_hate_speech_model.h5")
+model = load_model(r"E:\SEM5\DipLerning\DL_Project\HateSpeechDetection\models\bigru_hate_speech_model.h5")
 
 # Predictions
 probabilities = model.predict(X_test, verbose=0)

@@ -1,2 +1,4 @@
 models/*.h5 filter=lfs diff=lfs merge=lfs -text
 models/*.keras filter=lfs diff=lfs merge=lfs -text
+models/model.safetensors filter=lfs diff=lfs merge=lfs -text
+models/t5_neutralizer/** filter=lfs diff=lfs merge=lfs -text
