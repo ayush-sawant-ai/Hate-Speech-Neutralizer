@@ -1,9 +1,11 @@
-import streamlit as st
-import tensorflow as tf
-import numpy as np
+import html
+import os
 import pickle
 import re
 
+import numpy as np
+import streamlit as st
+import tensorflow as tf
 from tensorflow.keras.preprocessing.sequence import pad_sequences
 
 
@@ -22,13 +24,13 @@ st.set_page_config(
 # MODEL PATHS
 # ============================================================
 
+# Classifier (unchanged)
 CLASSIFIER_MODEL_PATH = "models/gru_hate_speech_model.h5"
 CLASSIFIER_TOKENIZER_PATH = "data/tokenizer.pkl"
 
-REWRITER_MODEL_PATH = "models/rewriting_seq2seq_gru.keras"
-SOURCE_TOKENIZER_PATH = "data/source_tokenizer.pkl"
-TARGET_TOKENIZER_PATH = "data/target_tokenizer.pkl"
-SEQUENCE_INFO_PATH = "data/rewriting_sequence_info.pkl"
+# Neutralizer: fine-tuned T5 folder (contains model.safetensors, config.json, tokenizer files)
+REWRITER_MODEL_DIR = "models/t5_neutralizer"
+REWRITER_PREFIX = "Rewrite neutrally: "   # must match the prefix used in training
 
 
 # ============================================================
@@ -57,6 +59,7 @@ st.markdown(
         border: 1px solid #dddddd;
         margin-top: 15px;
         margin-bottom: 15px;
+        color: #222222;
     }
 
     .toxic-box {
@@ -85,13 +88,6 @@ st.markdown(
         color: #555555;
     }
 
-    .model-card {
-        background-color: #f7f7f7;
-        padding: 15px;
-        border-radius: 8px;
-        margin-bottom: 10px;
-    }
-
     </style>
     """,
     unsafe_allow_html=True
@@ -99,7 +95,7 @@ st.markdown(
 
 
 # ============================================================
-# TEXT CLEANING
+# TEXT CLEANING (classifier only)
 # ============================================================
 
 def clean_text(text):
@@ -128,9 +124,7 @@ def clean_text(text):
 @st.cache_resource
 def load_classifier():
 
-    model = tf.keras.models.load_model(
-        CLASSIFIER_MODEL_PATH
-    )
+    model = tf.keras.models.load_model(CLASSIFIER_MODEL_PATH)
 
     with open(CLASSIFIER_TOKENIZER_PATH, "rb") as f:
         tokenizer = pickle.load(f)
@@ -146,19 +140,13 @@ def load_classifier():
     return model, tokenizer, classifier_maxlen
 
 
-# ============================================================
-# CLASSIFIER
-# ============================================================
-
 def classify_text(text):
 
     model, tokenizer, max_length = load_classifier()
 
     cleaned_text = clean_text(text)
 
-    sequence = tokenizer.texts_to_sequences(
-        [cleaned_text]
-    )
+    sequence = tokenizer.texts_to_sequences([cleaned_text])
 
     padded = pad_sequences(
         sequence,
@@ -167,18 +155,12 @@ def classify_text(text):
         truncating="post"
     ).astype(np.int32)
 
-    prediction = model.predict(
-        padded,
-        verbose=0
-    )
+    prediction = model.predict(padded, verbose=0)
 
-    # Your model has a single sigmoid output
+    # Single sigmoid output
     probability = float(prediction[0][0])
 
-    if probability >= 0.5:
-        label = "TOXIC"
-    else:
-        label = "SAFE"
+    label = "TOXIC" if probability >= 0.5 else "SAFE"
 
     return {
         "label": label,
@@ -187,302 +169,64 @@ def classify_text(text):
 
 
 # ============================================================
-# LOAD REWRITER
+# LOAD REWRITER (fine-tuned T5)
 # ============================================================
 
 @st.cache_resource
 def load_rewriter():
 
-    # Load trained full Seq2Seq model
-    model = tf.keras.models.load_model(
-        REWRITER_MODEL_PATH
-    )
+    # Imported here so the classifier still works if torch/transformers
+    # have a problem, and so TensorFlow loads first.
+    import torch
+    from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
 
-    # Load tokenizers
-    with open(SOURCE_TOKENIZER_PATH, "rb") as f:
-        source_tokenizer = pickle.load(f)
+    if not os.path.isdir(REWRITER_MODEL_DIR):
+        raise FileNotFoundError(
+            f"Neutralizer folder not found: '{REWRITER_MODEL_DIR}'. "
+            "Copy the trained t5_neutralizer folder into your models/ directory."
+        )
 
-    with open(TARGET_TOKENIZER_PATH, "rb") as f:
-        target_tokenizer = pickle.load(f)
+    tokenizer = AutoTokenizer.from_pretrained(REWRITER_MODEL_DIR)
+    model = AutoModelForSeq2SeqLM.from_pretrained(REWRITER_MODEL_DIR)
 
-    # Load sequence information
-    with open(SEQUENCE_INFO_PATH, "rb") as f:
-        sequence_info = pickle.load(f)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model.to(device)
+    model.eval()
 
-    return (
-        model,
-        source_tokenizer,
-        target_tokenizer,
-        sequence_info
-    )
+    return model, tokenizer, device
 
-
-# ============================================================
-# BUILD INFERENCE MODELS
-# ============================================================
-
-@st.cache_resource
-def build_rewriter():
-
-    (
-        model,
-        source_tokenizer,
-        target_tokenizer,
-        sequence_info
-    ) = load_rewriter()
-
-    # --------------------------------------------------------
-    # Sequence information
-    # --------------------------------------------------------
-
-    source_vocab_size = sequence_info["source_vocab_size"]
-    target_vocab_size = sequence_info["target_vocab_size"]
-
-    max_source_length = sequence_info["max_source_length"]
-    max_target_length = sequence_info["max_target_length"]
-
-    # --------------------------------------------------------
-    # Get trained layers
-    # --------------------------------------------------------
-
-    encoder_embedding = model.get_layer(
-        "encoder_embedding"
-    )
-
-    encoder_gru = model.get_layer(
-        "encoder_gru"
-    )
-
-    decoder_embedding = model.get_layer(
-        "decoder_embedding"
-    )
-
-    decoder_gru = model.get_layer(
-        "decoder_gru"
-    )
-
-    decoder_output_layer = model.get_layer(
-        "decoder_output"
-    )
-
-    latent_dim = int(
-        encoder_gru.units
-    )
-
-    # --------------------------------------------------------
-    # Encoder inference model
-    # --------------------------------------------------------
-
-    encoder_input = tf.keras.Input(
-        shape=(max_source_length,),
-        dtype=tf.int32,
-        name="inference_encoder_input"
-    )
-
-    encoder_embedded = encoder_embedding(
-        encoder_input
-    )
-
-    _, encoder_state = encoder_gru(
-        encoder_embedded
-    )
-
-    encoder_model = tf.keras.Model(
-        encoder_input,
-        encoder_state
-    )
-
-    # --------------------------------------------------------
-    # Decoder inference model
-    # --------------------------------------------------------
-
-    decoder_token_input = tf.keras.Input(
-        shape=(1,),
-        dtype=tf.int32,
-        name="inference_decoder_token"
-    )
-
-    decoder_state_input = tf.keras.Input(
-        shape=(latent_dim,),
-        dtype=tf.float32,
-        name="inference_decoder_state"
-    )
-
-    decoder_embedded = decoder_embedding(
-        decoder_token_input
-    )
-
-    decoder_output_sequence, decoder_state = decoder_gru(
-        decoder_embedded,
-        initial_state=decoder_state_input
-    )
-
-    decoder_prediction = decoder_output_layer(
-        decoder_output_sequence
-    )
-
-    decoder_model = tf.keras.Model(
-        [
-            decoder_token_input,
-            decoder_state_input
-        ],
-        [
-            decoder_prediction,
-            decoder_state
-        ]
-    )
-
-    return (
-        encoder_model,
-        decoder_model,
-        source_tokenizer,
-        target_tokenizer,
-        max_source_length,
-        max_target_length
-    )
-
-
-# ============================================================
-# REWRITE TEXT
-# ============================================================
 
 def rewrite_text(text):
 
-    (
-        encoder_model,
-        decoder_model,
-        source_tokenizer,
-        target_tokenizer,
-        max_source_length,
-        max_target_length
-    ) = build_rewriter()
+    import torch
 
-    # --------------------------------------------------------
-    # Clean input
-    # --------------------------------------------------------
+    model, tokenizer, device = load_rewriter()
 
-    cleaned_text = clean_text(text)
+    # T5 handles raw text well: do NOT lowercase or strip punctuation here.
+    source = REWRITER_PREFIX + str(text).strip()
 
-    # --------------------------------------------------------
-    # Tokenize source sentence
-    # --------------------------------------------------------
+    inputs = tokenizer(
+        source,
+        return_tensors="pt",
+        truncation=True,
+        max_length=64
+    ).to(device)
 
-    source_sequence = source_tokenizer.texts_to_sequences(
-        [cleaned_text]
-    )
-
-    encoder_input = pad_sequences(
-        source_sequence,
-        maxlen=max_source_length,
-        padding="post",
-        truncating="post"
-    ).astype(np.int32)
-
-    # --------------------------------------------------------
-    # Encode
-    # --------------------------------------------------------
-
-    state = encoder_model.predict(
-        encoder_input,
-        verbose=0
-    ).astype(np.float32)
-
-    # --------------------------------------------------------
-    # START / END tokens
-    # --------------------------------------------------------
-
-    start_id = target_tokenizer.word_index.get(
-        "<start>"
-    )
-
-    end_id = target_tokenizer.word_index.get(
-        "<end>"
-    )
-
-    if start_id is None:
-        raise ValueError(
-            "<start> token was not found in target tokenizer."
+    with torch.no_grad():
+        output_ids = model.generate(
+            **inputs,
+            num_beams=5,
+            no_repeat_ngram_size=3,
+            max_new_tokens=64,
+            early_stopping=True
         )
 
-    if end_id is None:
-        raise ValueError(
-            "<end> token was not found in target tokenizer."
-        )
-
-    # --------------------------------------------------------
-    # Initial decoder token
-    # --------------------------------------------------------
-
-    current_token = np.array(
-        [[start_id]],
-        dtype=np.int32
-    )
-
-    generated_words = []
-
-    # --------------------------------------------------------
-    # Greedy decoding
-    # --------------------------------------------------------
-
-    for _ in range(max_target_length - 1):
-
-        prediction, state = decoder_model.predict(
-            [
-                current_token,
-                state
-            ],
-            verbose=0
-        )
-
-        predicted_id = int(
-            np.argmax(
-                prediction[0, -1, :]
-            )
-        )
-
-        # Stop conditions
-        if predicted_id == end_id:
-            break
-
-        if predicted_id == 0:
-            break
-
-        # Convert token ID to word
-        word = target_tokenizer.index_word.get(
-            predicted_id,
-            ""
-        )
-
-        if word:
-
-            if word not in [
-                "<start>",
-                "<end>",
-                "<OOV>"
-            ]:
-
-                generated_words.append(
-                    word
-                )
-
-        # Feed predicted token back to decoder
-        current_token = np.array(
-            [[predicted_id]],
-            dtype=np.int32
-        )
-
-    # --------------------------------------------------------
-    # Final sentence
-    # --------------------------------------------------------
-
-    result = " ".join(
-        generated_words
+    result = tokenizer.decode(
+        output_ids[0],
+        skip_special_tokens=True
     ).strip()
 
-    if not result:
-        return None
-
-    return result
+    return result if result else None
 
 
 # ============================================================
@@ -498,6 +242,15 @@ if "rewritten_text" not in st.session_state:
 if "last_input_text" not in st.session_state:
     st.session_state.last_input_text = ""
 
+if "input_text" not in st.session_state:
+    st.session_state.input_text = ""
+
+
+def set_example(example_text):
+    st.session_state.input_text = example_text
+    st.session_state.classification_result = None
+    st.session_state.rewritten_text = None
+
 
 # ============================================================
 # HEADER
@@ -512,7 +265,7 @@ st.markdown(
     """
     <div class="subtitle">
     Detect potentially toxic speech and generate a neutralized version
-    using a trained GRU-based NLP pipeline.
+    using a GRU classifier and a fine-tuned T5 rewriting model.
     </div>
     """,
     unsafe_allow_html=True
@@ -535,7 +288,7 @@ with st.sidebar:
 
         **Rewriting Model**
 
-        Seq2Seq GRU encoder-decoder
+        Fine-tuned T5 (text-to-text transformer)
 
         **Detection Threshold**
 
@@ -545,13 +298,8 @@ with st.sidebar:
 
     st.divider()
 
-    st.caption(
-        "The classifier produces a single sigmoid probability."
-    )
-
-    st.caption(
-        "The rewriting model uses <start> and <end> tokens."
-    )
+    st.caption("The classifier produces a single sigmoid probability.")
+    st.caption("The rewriter uses beam search decoding.")
 
 
 # ============================================================
@@ -563,51 +311,30 @@ st.subheader("Test Input")
 example_columns = st.columns(3)
 
 examples = [
-    (
-        "Toxic example",
-        "I hate you and your stupid behavior."
-    ),
-    (
-        "Another example",
-        "People like you should leave this place."
-    ),
-    (
-        "Safe example",
-        "I really enjoyed the community event this weekend."
-    )
+    ("Toxic example", "I hate you and your stupid behavior."),
+    ("Another example", "People like you should leave this place."),
+    ("Safe example", "I really enjoyed the community event this weekend."),
 ]
 
-for column, (button_text, example_text) in zip(
-    example_columns,
-    examples
-):
+for column, (button_text, example_text) in zip(example_columns, examples):
 
     with column:
 
-        if st.button(
+        st.button(
             button_text,
-            use_container_width=True
-        ):
-
-            st.session_state.input_text = example_text
-
-            # Clear old results when changing example
-            st.session_state.classification_result = None
-            st.session_state.rewritten_text = None
+            use_container_width=True,
+            on_click=set_example,
+            args=(example_text,)
+        )
 
 
 # ============================================================
 # TEXT INPUT
 # ============================================================
 
-if "input_text" not in st.session_state:
-
-    st.session_state.input_text = ""
-
-
 input_text = st.text_area(
     "Enter a sentence",
-    value=st.session_state.input_text,
+    key="input_text",
     height=130,
     max_chars=500,
     placeholder="Type a sentence here..."
@@ -633,26 +360,17 @@ if detect_button:
 
     if not input_text.strip():
 
-        st.warning(
-            "Please enter some text first."
-        )
+        st.warning("Please enter some text first.")
 
     else:
 
         try:
 
-            with st.spinner(
-                "Running hate speech classifier..."
-            ):
+            with st.spinner("Running hate speech classifier..."):
+                result = classify_text(input_text)
 
-                result = classify_text(
-                    input_text
-                )
-
-            # IMPORTANT:
-            # Store result so it survives Streamlit reruns
+            # Store so results survive Streamlit reruns
             st.session_state.classification_result = result
-
             st.session_state.last_input_text = input_text
 
             # Clear previous rewrite
@@ -660,10 +378,7 @@ if detect_button:
 
         except Exception as e:
 
-            st.error(
-                "Unable to run the classifier."
-            )
-
+            st.error("Unable to run the classifier.")
             st.exception(e)
 
 
@@ -672,7 +387,6 @@ if detect_button:
 # ============================================================
 
 result = st.session_state.classification_result
-
 
 if result is not None:
 
@@ -703,10 +417,6 @@ if result is not None:
             unsafe_allow_html=True
         )
 
-        # ----------------------------------------------------
-        # GENERATE NEUTRAL VERSION
-        # ----------------------------------------------------
-
         generate_button = st.button(
             "Generate Neutral Version",
             type="primary",
@@ -717,27 +427,18 @@ if result is not None:
 
             try:
 
-                with st.spinner(
-                    "Generating neutral version..."
-                ):
-
+                with st.spinner("Generating neutral version..."):
                     rewritten = rewrite_text(
                         st.session_state.last_input_text
                     )
 
-                # IMPORTANT:
-                # Store generated text in session state.
-                # This prevents it disappearing after rerun.
                 st.session_state.rewritten_text = rewritten
 
             except Exception as e:
 
                 st.session_state.rewritten_text = None
 
-                st.error(
-                    "Unable to generate the neutral version."
-                )
-
+                st.error("Unable to generate the neutral version.")
                 st.exception(e)
 
     else:
@@ -760,9 +461,7 @@ if result is not None:
             unsafe_allow_html=True
         )
 
-        st.info(
-            "The input does not require neutralization."
-        )
+        st.info("The input does not require neutralization.")
 
 
 # ============================================================
@@ -770,7 +469,6 @@ if result is not None:
 # ============================================================
 
 rewritten_text = st.session_state.rewritten_text
-
 
 if rewritten_text:
 
@@ -787,17 +485,12 @@ if rewritten_text:
         </div>
 
         <div style="font-size:17px;">
-        {rewritten_text}
+        {html.escape(rewritten_text)}
         </div>
 
         </div>
         """,
         unsafe_allow_html=True
-    )
-
-    # Also provide normal Streamlit output
-    st.success(
-        rewritten_text
     )
 
 
@@ -839,17 +532,15 @@ with st.expander("Model Details"):
             """
             ### Neutralization Model
 
-            **Architecture:** Seq2Seq GRU
+            **Architecture:** Fine-tuned T5 (encoder-decoder transformer)
 
-            **Encoder:** GRU (256 units)
+            **Task:** Toxic-to-neutral text rewriting
 
-            **Decoder:** GRU (256 units)
+            **Training data:** Parallel toxic/neutral sentence pairs
 
-            **Embedding:** 128 dimensions
+            **Decoding:** Beam search (5 beams)
 
-            **Decoding:** Greedy decoding
-
-            **Special tokens:** `<start>`, `<end>`
+            **Input:** Raw text with a task prefix
             """
         )
 
@@ -860,6 +551,4 @@ with st.expander("Model Details"):
 
 st.divider()
 
-st.caption(
-    "Hate Speech Neutralizer — Deep Learning Project"
-)
+st.caption("Hate Speech Neutralizer — Deep Learning Project")
