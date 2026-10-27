@@ -1,0 +1,21 @@
+# Python virtual environments & packages
+.venv/
+env/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+
+# OS metadata
+.DS_Store
+Thumbs.db
+
+# User environment variables
+.env
+
+# Model checkpoints and backups
+models/**/checkpoint-*/
+models/t5_neutralizer_legacy/
+

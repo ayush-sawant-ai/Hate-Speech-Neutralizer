@@ -1,9 +1,15 @@
+import sys
+from pathlib import Path
 import tensorflow as tf
 import pickle
 import numpy as np
 
-MODEL_PATH = "models/gru_hate_speech_model.h5"
-TOKENIZER_PATH = "data/tokenizer.pkl"
+BASE_DIR = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(BASE_DIR))
+from src.preprocessing.cleaner import clean_for_classifier
+
+MODEL_PATH = BASE_DIR / "models" / "bigru_hate_speech_model.h5"
+TOKENIZER_PATH = BASE_DIR / "data" / "tokenizer.pkl"
 
 # Load model
 model = tf.keras.models.load_model(
@@ -37,7 +43,8 @@ texts = [
     "The weather is beautiful today."
 ]
 
-sequences = tokenizer.texts_to_sequences(texts)
+cleaned_texts = [clean_for_classifier(t) for t in texts]
+sequences = tokenizer.texts_to_sequences(cleaned_texts)
 
 print("\nSequences:")
 for text, seq in zip(texts, sequences):

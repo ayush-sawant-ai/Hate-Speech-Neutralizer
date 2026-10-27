@@ -48,12 +48,17 @@
 
 
 import pickle
+from pathlib import Path
 import numpy as np
 from tensorflow.keras.models import load_model
-from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, classification_report, confusion_matrix
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+data_path = BASE_DIR / "data" / "test_data.pkl"
+model_path = BASE_DIR / "models" / "bigru_hate_speech_model.h5"
 
 # Load test data
-with open(r"E:\SEM5\DipLerning\DL_Project\HateSpeechDetection\data\test_data.pkl", "rb") as f:
+with open(data_path, "rb") as f:
     X_test, y_test = pickle.load(f)
 
 
@@ -81,8 +86,8 @@ def evaluate_model(model_path, model_name):
 from sklearn.metrics import classification_report, confusion_matrix
 import numpy as np
 
-# Load final GRU
-model = load_model(r"E:\SEM5\DipLerning\DL_Project\HateSpeechDetection\models\bigru_hate_speech_model.h5")
+# Load final BiGRU
+model = load_model(str(model_path))
 
 # Predictions
 probabilities = model.predict(X_test, verbose=0)

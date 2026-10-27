@@ -1,554 +1,311 @@
-import html
-import os
-import pickle
-import re
+"""Hate Speech Neutralizer - Desktop Workspace Application.
 
-import numpy as np
+A production-grade text analysis and constructive neutralization tool combining
+recurrent neural classification (BiGRU, GRU, BiLSTM, LSTM) with fine-tuned
+T5 text-to-text rewriting.
+"""
+
+from pathlib import Path
 import streamlit as st
-import tensorflow as tf
-from tensorflow.keras.preprocessing.sequence import pad_sequences
 
+from src.config import (
+    CLASSIFIER_CHECKPOINTS,
+    DEFAULT_CLASSIFIER_KEY,
+    DEFAULT_THRESHOLD,
+    SAFE_THRESHOLD_MAX,
+    SAFE_THRESHOLD_MIN,
+)
+from src.classification.detector import ToxicityDetector
+from src.rewriting.neutralizer import TextNeutralizer
+from src.ui.app_state import (
+    init_session_state,
+    on_model_or_threshold_change,
+    on_text_input_change,
+    reset_workspace,
+    set_example_input,
+)
+from src.ui.components import (
+    inject_custom_styles,
+    render_classification_card,
+    render_header,
+    render_rewritten_card,
+)
 
-# ============================================================
-# PAGE CONFIG
-# ============================================================
-
+# Page configuration
 st.set_page_config(
     page_title="Hate Speech Neutralizer",
     page_icon="🛡️",
-    layout="wide"
+    layout="wide",
+    initial_sidebar_state="auto"
 )
 
+# Apply custom restrained CSS styling
+inject_custom_styles()
 
-# ============================================================
-# MODEL PATHS
-# ============================================================
+# Initialize session state variables
+init_session_state()
 
-# Classifier (unchanged)
-CLASSIFIER_MODEL_PATH = "models/gru_hate_speech_model.h5"
-CLASSIFIER_TOKENIZER_PATH = "data/tokenizer.pkl"
 
-# Neutralizer: fine-tuned T5 folder (contains model.safetensors, config.json, tokenizer files)
-REWRITER_MODEL_DIR = "models/t5_neutralizer"
-REWRITER_PREFIX = "Rewrite neutrally: "   # must match the prefix used in training
+# Cached Model Loaders
+@st.cache_resource(show_spinner="Loading toxicity classification model...")
+def get_cached_detector(model_key: str) -> ToxicityDetector:
+    """Load and cache the neural toxicity classifier for the given model_key."""
+    detector = ToxicityDetector(model_key=model_key, threshold=st.session_state.detection_threshold)
+    detector.load()
+    return detector
 
 
-# ============================================================
-# CUSTOM CSS
-# ============================================================
+@st.cache_resource(show_spinner="Loading T5 neutralization transformer...")
+def get_cached_neutralizer() -> TextNeutralizer:
+    """Load and cache the T5 sequence-to-sequence model."""
+    neutralizer = TextNeutralizer()
+    neutralizer.load()
+    return neutralizer
 
-st.markdown(
-    """
-    <style>
 
-    .main-title {
-        font-size: 34px;
-        font-weight: 700;
-        margin-bottom: 5px;
-    }
-
-    .subtitle {
-        color: #666666;
-        font-size: 16px;
-        margin-bottom: 25px;
-    }
-
-    .result-box {
-        padding: 18px;
-        border-radius: 10px;
-        border: 1px solid #dddddd;
-        margin-top: 15px;
-        margin-bottom: 15px;
-        color: #222222;
-    }
-
-    .toxic-box {
-        background-color: #fff4f4;
-        border-left: 5px solid #d9534f;
-    }
-
-    .safe-box {
-        background-color: #f3fff5;
-        border-left: 5px solid #28a745;
-    }
-
-    .neutral-box {
-        background-color: #f4f8ff;
-        border-left: 5px solid #4285f4;
-    }
-
-    .result-title {
-        font-size: 20px;
-        font-weight: 650;
-        margin-bottom: 8px;
-    }
-
-    .confidence {
-        font-size: 15px;
-        color: #555555;
-    }
-
-    </style>
-    """,
-    unsafe_allow_html=True
-)
-
-
-# ============================================================
-# TEXT CLEANING (classifier only)
-# ============================================================
-
-def clean_text(text):
-
-    text = str(text).lower()
-
-    # Remove URLs
-    text = re.sub(r"http\S+|www\S+|https\S+", "", text)
-
-    # Remove mentions
-    text = re.sub(r"@\w+", "", text)
-
-    # Keep alphabetic characters and spaces
-    text = re.sub(r"[^a-zA-Z\s]", " ", text)
-
-    # Remove extra spaces
-    text = re.sub(r"\s+", " ", text).strip()
-
-    return text
-
-
-# ============================================================
-# LOAD CLASSIFIER
-# ============================================================
-
-@st.cache_resource
-def load_classifier():
-
-    model = tf.keras.models.load_model(CLASSIFIER_MODEL_PATH)
-
-    with open(CLASSIFIER_TOKENIZER_PATH, "rb") as f:
-        tokenizer = pickle.load(f)
-
-    # Get model input length dynamically
-    input_shape = model.input_shape
-
-    if isinstance(input_shape, list):
-        input_shape = input_shape[0]
-
-    classifier_maxlen = input_shape[1]
-
-    return model, tokenizer, classifier_maxlen
-
-
-def classify_text(text):
-
-    model, tokenizer, max_length = load_classifier()
-
-    cleaned_text = clean_text(text)
-
-    sequence = tokenizer.texts_to_sequences([cleaned_text])
-
-    padded = pad_sequences(
-        sequence,
-        maxlen=max_length,
-        padding="post",
-        truncating="post"
-    ).astype(np.int32)
-
-    prediction = model.predict(padded, verbose=0)
-
-    # Single sigmoid output
-    probability = float(prediction[0][0])
-
-    label = "TOXIC" if probability >= 0.5 else "SAFE"
-
-    return {
-        "label": label,
-        "probability": probability
-    }
-
-
-# ============================================================
-# LOAD REWRITER (fine-tuned T5)
-# ============================================================
-
-@st.cache_resource
-def load_rewriter():
-
-    # Imported here so the classifier still works if torch/transformers
-    # have a problem, and so TensorFlow loads first.
-    import torch
-    from transformers import AutoTokenizer, AutoModelForSeq2SeqLM
-
-    if not os.path.isdir(REWRITER_MODEL_DIR):
-        raise FileNotFoundError(
-            f"Neutralizer folder not found: '{REWRITER_MODEL_DIR}'. "
-            "Copy the trained t5_neutralizer folder into your models/ directory."
-        )
-
-    tokenizer = AutoTokenizer.from_pretrained(REWRITER_MODEL_DIR)
-    model = AutoModelForSeq2SeqLM.from_pretrained(REWRITER_MODEL_DIR)
-
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    model.to(device)
-    model.eval()
-
-    return model, tokenizer, device
-
-
-def rewrite_text(text):
-
-    import torch
-
-    model, tokenizer, device = load_rewriter()
-
-    # T5 handles raw text well: do NOT lowercase or strip punctuation here.
-    source = REWRITER_PREFIX + str(text).strip()
-
-    inputs = tokenizer(
-        source,
-        return_tensors="pt",
-        truncation=True,
-        max_length=64
-    ).to(device)
-
-    with torch.no_grad():
-        output_ids = model.generate(
-            **inputs,
-            num_beams=5,
-            no_repeat_ngram_size=3,
-            max_new_tokens=64,
-            early_stopping=True
-        )
-
-    result = tokenizer.decode(
-        output_ids[0],
-        skip_special_tokens=True
-    ).strip()
-
-    return result if result else None
-
-
-# ============================================================
-# SESSION STATE
-# ============================================================
-
-if "classification_result" not in st.session_state:
-    st.session_state.classification_result = None
-
-if "rewritten_text" not in st.session_state:
-    st.session_state.rewritten_text = None
-
-if "last_input_text" not in st.session_state:
-    st.session_state.last_input_text = ""
-
-if "input_text" not in st.session_state:
-    st.session_state.input_text = ""
-
-
-def set_example(example_text):
-    st.session_state.input_text = example_text
-    st.session_state.classification_result = None
-    st.session_state.rewritten_text = None
-
-
-# ============================================================
-# HEADER
-# ============================================================
-
-st.markdown(
-    '<div class="main-title">Hate Speech Neutralizer</div>',
-    unsafe_allow_html=True
-)
-
-st.markdown(
-    """
-    <div class="subtitle">
-    Detect potentially toxic speech and generate a neutralized version
-    using a GRU classifier and a fine-tuned T5 rewriting model.
-    </div>
-    """,
-    unsafe_allow_html=True
-)
-
-
-# ============================================================
-# SIDEBAR
-# ============================================================
-
+# Sidebar Configuration and Model Controls
 with st.sidebar:
+    st.markdown("### Model Configuration")
 
-    st.header("Model Information")
+    model_options = list(CLASSIFIER_CHECKPOINTS.keys())
+    model_labels = [CLASSIFIER_CHECKPOINTS[k]["name"] for k in model_options]
 
-    st.markdown(
-        """
-        **Detection Model**
+    current_index = model_options.index(st.session_state.active_model_key) if st.session_state.active_model_key in model_options else 0
 
-        GRU-based binary classifier
+    def handle_sidebar_model_change():
+        new_label = st.session_state.sidebar_model_select
+        new_key = model_options[model_labels.index(new_label)]
+        if new_key != st.session_state.active_model_key:
+            st.session_state.active_model_key = new_key
+            on_model_or_threshold_change()
 
-        **Rewriting Model**
-
-        Fine-tuned T5 (text-to-text transformer)
-
-        **Detection Threshold**
-
-        0.50
-        """
+    selected_label = st.selectbox(
+        "Classifier Architecture",
+        options=model_labels,
+        index=current_index,
+        key="sidebar_model_select",
+        help="Select which recurrent neural network checkpoint to load for toxicity detection.",
+        on_change=handle_sidebar_model_change
     )
-
-    st.divider()
-
-    st.caption("The classifier produces a single sigmoid probability.")
-    st.caption("The rewriter uses beam search decoding.")
-
-
-# ============================================================
-# EXAMPLE INPUTS
-# ============================================================
-
-st.subheader("Test Input")
-
-example_columns = st.columns(3)
-
-examples = [
-    ("Toxic example", "I hate you and your stupid behavior."),
-    ("Another example", "People like you should leave this place."),
-    ("Safe example", "I really enjoyed the community event this weekend."),
-]
-
-for column, (button_text, example_text) in zip(example_columns, examples):
-
-    with column:
-
-        st.button(
-            button_text,
-            use_container_width=True,
-            on_click=set_example,
-            args=(example_text,)
-        )
-
-
-# ============================================================
-# TEXT INPUT
-# ============================================================
-
-input_text = st.text_area(
-    "Enter a sentence",
-    key="input_text",
-    height=130,
-    max_chars=500,
-    placeholder="Type a sentence here..."
-)
-
-
-# ============================================================
-# DETECT BUTTON
-# ============================================================
-
-detect_button = st.button(
-    "Detect Speech",
-    type="primary",
-    use_container_width=True
-)
-
-
-# ============================================================
-# DETECTION
-# ============================================================
-
-if detect_button:
-
-    if not input_text.strip():
-
-        st.warning("Please enter some text first.")
-
-    else:
-
-        try:
-
-            with st.spinner("Running hate speech classifier..."):
-                result = classify_text(input_text)
-
-            # Store so results survive Streamlit reruns
-            st.session_state.classification_result = result
-            st.session_state.last_input_text = input_text
-
-            # Clear previous rewrite
-            st.session_state.rewritten_text = None
-
-        except Exception as e:
-
-            st.error("Unable to run the classifier.")
-            st.exception(e)
-
-
-# ============================================================
-# DISPLAY CLASSIFICATION RESULT
-# ============================================================
-
-result = st.session_state.classification_result
-
-if result is not None:
-
-    probability = result["probability"]
-    label = result["label"]
-
-    st.divider()
-
-    st.subheader("Classification Result")
-
-    if label == "TOXIC":
-
-        st.markdown(
-            f"""
-            <div class="result-box toxic-box">
-
-            <div class="result-title">
-            ⚠️ Toxic / Hate Speech Detected
-            </div>
-
-            <div class="confidence">
-            Toxicity probability:
-            <strong>{probability * 100:.2f}%</strong>
-            </div>
-
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
-
-        generate_button = st.button(
-            "Generate Neutral Version",
-            type="primary",
-            use_container_width=True
-        )
-
-        if generate_button:
-
-            try:
-
-                with st.spinner("Generating neutral version..."):
-                    rewritten = rewrite_text(
-                        st.session_state.last_input_text
-                    )
-
-                st.session_state.rewritten_text = rewritten
-
-            except Exception as e:
-
-                st.session_state.rewritten_text = None
-
-                st.error("Unable to generate the neutral version.")
-                st.exception(e)
-
-    else:
-
-        st.markdown(
-            f"""
-            <div class="result-box safe-box">
-
-            <div class="result-title">
-            ✓ Safe / Non-Toxic
-            </div>
-
-            <div class="confidence">
-            Safe probability:
-            <strong>{(1 - probability) * 100:.2f}%</strong>
-            </div>
-
-            </div>
-            """,
-            unsafe_allow_html=True
-        )
-
-        st.info("The input does not require neutralization.")
-
-
-# ============================================================
-# DISPLAY NEUTRALIZED VERSION
-# ============================================================
-
-rewritten_text = st.session_state.rewritten_text
-
-if rewritten_text:
-
-    st.divider()
-
-    st.subheader("Neutralized Version")
+    selected_model_key = model_options[model_labels.index(selected_label)]
+    st.session_state.active_model_key = selected_model_key
 
     st.markdown(
-        f"""
-        <div class="result-box neutral-box">
-
-        <div class="result-title">
-        Neutralized Text
-        </div>
-
-        <div style="font-size:17px;">
-        {html.escape(rewritten_text)}
-        </div>
-
-        </div>
-        """,
+        f"<div style='font-size:12px; color:#475569; margin-top:-8px; margin-bottom:16px; line-height:1.4;'>"
+        f"{CLASSIFIER_CHECKPOINTS[selected_model_key]['description']}"
+        f"</div>",
         unsafe_allow_html=True
     )
 
+    def handle_sidebar_threshold_change():
+        on_model_or_threshold_change()
 
-# ============================================================
-# MODEL DETAILS
-# ============================================================
+    threshold = st.slider(
+        "Decision Threshold",
+        min_value=SAFE_THRESHOLD_MIN,
+        max_value=SAFE_THRESHOLD_MAX,
+        value=float(st.session_state.detection_threshold),
+        step=0.05,
+        key="threshold_slider",
+        help=(
+            "Threshold determining when a model score is flagged as TOXIC. "
+            "Lower values flag more content but increase false alarms; "
+            "higher values reduce false alarms but may miss subtle hostility."
+        ),
+        on_change=handle_sidebar_threshold_change
+    )
+    st.session_state.detection_threshold = threshold
 
+    st.markdown(
+        f"<div style='font-size:12px; color:#475569; margin-top:-6px;'>"
+        f"Active decision threshold: <strong>{threshold:.2f}</strong>"
+        f"</div>",
+        unsafe_allow_html=True
+    )
+
+    st.divider()
+
+    st.markdown("### Sample Test Cases")
+    sample_cases = [
+        ("Direct Insult", "You are a complete idiot and nobody cares what you think."),
+        ("Abusive Request", "You are such a shit, improve your work."),
+        ("Code Review Attack", "This code is trash, fix it."),
+        ("Hostile Demand", "Shut up and listen to me."),
+        ("Flawed Explanation", "Your explanation is stupid and makes no sense."),
+        ("Legitimate Disagreement (Safe)", "I disagree with your proposal because latency is too high."),
+        ("Extreme Threat (Unsafe)", "I will find you and hurt you."),
+    ]
+
+    for label, sample_text in sample_cases:
+        st.button(
+            label,
+            use_container_width=True,
+            on_click=set_example_input,
+            args=(sample_text,)
+        )
+
+    st.divider()
+    st.button(
+        "Clear",
+        key="sidebar_clear_btn",
+        use_container_width=True,
+        on_click=reset_workspace
+    )
+
+
+# Render Header with dynamic model name
+active_name = CLASSIFIER_CHECKPOINTS[st.session_state.active_model_key]["name"]
+render_header(active_model_name=active_name)
+
+# Two-Column Workspace Layout
+col_input, col_output = st.columns([1, 1], gap="large")
+
+with col_input:
+    st.markdown(
+        '<div style="font-weight:600; font-size:14px; margin-bottom:6px; color:#172033;">Input Text</div>',
+        unsafe_allow_html=True
+    )
+
+    text_input = st.text_area(
+        label="Input text for toxicity screening",
+        key="input_text",
+        height=130,
+        max_chars=1000,
+        placeholder="Type or paste text to evaluate for toxicity...",
+        label_visibility="collapsed",
+        on_change=on_text_input_change
+    )
+
+    char_count = len(text_input) if text_input else 0
+    st.markdown(
+        f'<div class="char-count">{char_count} / 1000 characters</div>',
+        unsafe_allow_html=True
+    )
+
+    action_col1, action_col2 = st.columns([2, 1])
+    with action_col1:
+        analyze_btn = st.button("Analyze text", type="primary", use_container_width=True)
+    with action_col2:
+        st.button("Clear", key="main_clear_btn", use_container_width=True, on_click=reset_workspace)
+
+    # Trigger Analysis
+    if analyze_btn:
+        if not text_input.strip():
+            st.warning("Please enter non-empty text to analyze.")
+        else:
+            try:
+                detector = get_cached_detector(model_key=st.session_state.active_model_key)
+                with st.spinner("Analyzing text sequence..."):
+                    result = detector.predict(text_input, threshold=st.session_state.detection_threshold)
+
+                st.session_state.classification_result = result
+                st.session_state.analyzed_text = text_input
+                st.session_state.rewritten_result = None
+                st.session_state.is_stale = False
+
+            except Exception as e:
+                st.error("Error during toxicity classification.")
+                st.exception(e)
+
+    # Render Classification Diagnostics
+    if st.session_state.classification_result is not None:
+        render_classification_card(st.session_state.classification_result)
+
+        # Show Generate Constructive Rewrite action if toxic
+        is_toxic = st.session_state.classification_result.get("is_toxic", False)
+        if is_toxic:
+            generate_btn = st.button(
+                "Generate constructive rewrite",
+                type="primary",
+                use_container_width=True,
+                disabled=st.session_state.is_stale
+            )
+            if generate_btn:
+                try:
+                    neutralizer = get_cached_neutralizer()
+                    detector = get_cached_detector(model_key=st.session_state.active_model_key)
+                    with st.spinner("Rewriting using constructive T5 model..."):
+                        rewrite_res = neutralizer.rewrite(
+                            st.session_state.analyzed_text,
+                            detector_instance=detector,
+                            original_prob=st.session_state.classification_result["probability"],
+                            threshold=st.session_state.detection_threshold
+                        )
+                    st.session_state.rewritten_result = rewrite_res
+                    st.rerun()
+
+                except Exception as e:
+                    st.error("Error during neutral text generation.")
+                    st.exception(e)
+        else:
+            st.markdown(
+                "<div style='font-size:13px; color:#166534; margin-top:8px;'>"
+                "✓ Screened as non-toxic. Constructive rewriting is not required for legitimate criticism or safe text."
+                "</div>",
+                unsafe_allow_html=True
+            )
+
+
+with col_output:
+    st.markdown(
+        '<div style="font-weight:600; font-size:14px; margin-bottom:6px; color:#172033;">Constructive Output</div>',
+        unsafe_allow_html=True
+    )
+
+    is_currently_toxic = (
+        st.session_state.classification_result.get("is_toxic", False)
+        if st.session_state.classification_result is not None
+        else True
+    )
+
+    render_rewritten_card(
+        original_text=st.session_state.analyzed_text,
+        rewritten_res=st.session_state.rewritten_result,
+        is_toxic=is_currently_toxic
+    )
+
+    # Working visible Copy control (only displayed when acceptable rewrite exists)
+    if (
+        st.session_state.rewritten_result
+        and st.session_state.rewritten_result.get("is_acceptable")
+        and st.session_state.rewritten_result.get("rewritten_text")
+    ):
+        copy_text = st.session_state.rewritten_result["rewritten_text"]
+        st.markdown(
+            '<div style="font-size:12px; font-weight:600; color:#475569; margin-top:12px; margin-bottom:4px;">'
+            'Copy Rewrite'
+            '</div>',
+            unsafe_allow_html=True
+        )
+        st.code(copy_text, language=None)
+
+
+# Technical & Limitations Collapsible Section
 st.divider()
 
-with st.expander("Model Details"):
-
+with st.expander("Model Details, Architecture & Dataset Limitations"):
     col1, col2 = st.columns(2)
 
     with col1:
-
         st.markdown(
             """
-            ### Hate Speech Detector
-
-            **Architecture:** GRU
-
-            **Task:** Binary classification
-
-            **Output:** Sigmoid probability
-
-            **Threshold:** 0.50
-
-            **Input:** Cleaned text
-
-            **Tokenizer:** Keras Tokenizer
-
-            **Vocabulary:** 20,000
+            #### Detection Architecture
+            - **Models Available:** Bidirectional GRU, Standard GRU, Bidirectional LSTM, Standard LSTM.
+            - **Input Preprocessing:** Unicode NFKC normalization, lowercasing, URL & mention stripping, alpha-numeric retaining. Padded/truncated to 200 tokens.
+            - **Dataset:** Trained on Jigsaw Toxic Comments dataset.
+            - **Important Target Definition:** Binary classification represents general toxicity. It is not an explicit demographic hate-speech category classifier; toxic speech includes general insults, profanity, and harassment.
+            - **Model Output Calibration:** Sigmoid activations reflect uncalibrated network scores rather than Bayesian posterior probabilities.
             """
         )
 
     with col2:
-
         st.markdown(
             """
-            ### Neutralization Model
-
-            **Architecture:** Fine-tuned T5 (encoder-decoder transformer)
-
-            **Task:** Toxic-to-neutral text rewriting
-
-            **Training data:** Parallel toxic/neutral sentence pairs
-
-            **Decoding:** Beam search (5 beams)
-
-            **Input:** Raw text with a task prefix
+            #### Neutralization Architecture
+            - **Model:** Fine-tuned `google/flan-t5-base` sequence-to-sequence transformer.
+            - **Instruction Prompt:** Constructive instruction directing the model to remove insults, preserve feedback or requests, and output complete grammatical sentences.
+            - **Decoding Strategy:** 4-beam search with 3-gram repetition penalty and bounded alternative generation retry.
+            - **Validation Verification:** Re-scoring using the identical classifier function, broken syntax detection, message loss checks, and violent threat safety filters.
+            - **Threat Intent Transformation:** Safe alternatives cannot preserve harmful violent intent; explicit violent threats cannot be safely paraphrased and are suppressed.
             """
         )
-
-
-# ============================================================
-# FOOTER
-# ============================================================
-
-st.divider()
-
-st.caption("Hate Speech Neutralizer — Deep Learning Project")

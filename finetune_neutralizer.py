@@ -1,69 +1,90 @@
-# pip install transformers datasets accelerate torch pandas sentencepiece
+"""Fine-tuning script for training T5 neutralization model on constructive sentence pairs."""
+
+from pathlib import Path
 import pandas as pd
 from datasets import Dataset
+import torch
 from transformers import (
-    AutoTokenizer, AutoModelForSeq2SeqLM,
-    DataCollatorForSeq2Seq, Seq2SeqTrainer, Seq2SeqTrainingArguments,
+    AutoTokenizer,
+    AutoModelForSeq2SeqLM,
+    DataCollatorForSeq2Seq,
+    Seq2SeqTrainer,
+    Seq2SeqTrainingArguments,
 )
 
-MODEL = "google/flan-t5-base"   # use "google/flan-t5-small" if memory/time is tight
-PREFIX = "Rewrite neutrally: "
+from src.config import REWRITER_INSTRUCTION
 
-# 1. Data: same CSV as before (columns: toxic, neutral)
-df = pd.read_csv("data/rewriting_pairs.csv").dropna().drop_duplicates()
-ds = Dataset.from_pandas(df, preserve_index=False).train_test_split(test_size=0.1, seed=42)
+BASE_DIR = Path(__file__).resolve().parent
+TRAIN_DATA_PATH = BASE_DIR / "data" / "constructive_train.csv"
+VAL_DATA_PATH = BASE_DIR / "data" / "constructive_val.csv"
+OUTPUT_DIR = BASE_DIR / "models" / "t5_neutralizer"
 
-tok = AutoTokenizer.from_pretrained(MODEL)
+MODEL_NAME = "google/flan-t5-base"
+MAX_SOURCE_LEN = 128
+MAX_TARGET_LEN = 64
 
-def preprocess(batch):
-    enc = tok([PREFIX + t for t in batch["toxic"]], max_length=64, truncation=True)
-    enc["labels"] = tok(text_target=batch["neutral"], max_length=64, truncation=True)["input_ids"]
-    return enc
 
-tokenized = ds.map(preprocess, batched=True, remove_columns=ds["train"].column_names)
+def prepare_dataset():
+    if not TRAIN_DATA_PATH.exists() or not VAL_DATA_PATH.exists():
+        from src.rewriting.prepare_constructive_data import main as prep_main
+        prep_main()
 
-# 2. Model + training
-model = AutoModelForSeq2SeqLM.from_pretrained(MODEL)
+    train_df = pd.read_csv(TRAIN_DATA_PATH).dropna()
+    val_df = pd.read_csv(VAL_DATA_PATH).dropna()
 
-args = Seq2SeqTrainingArguments(
-    output_dir="models/t5_neutralizer",
-    learning_rate=3e-4,
-    per_device_train_batch_size=16,
-    per_device_eval_batch_size=32,
-    num_train_epochs=4,
-    eval_strategy="epoch",          # older transformers versions: evaluation_strategy="epoch"
-    save_strategy="epoch",
-    load_best_model_at_end=True,
-    metric_for_best_model="eval_loss",
-    save_total_limit=2,
-    logging_steps=50,
-    fp16=False,                     # set True on a CUDA GPU (not for T5 if you see NaN loss; then use bf16)
-)
+    train_ds = Dataset.from_pandas(train_df, preserve_index=False)
+    val_ds = Dataset.from_pandas(val_df, preserve_index=False)
+    return train_ds, val_ds
 
-trainer = Seq2SeqTrainer(
-    model=model,
-    args=args,
-    train_dataset=tokenized["train"],
-    eval_dataset=tokenized["test"],
-    data_collator=DataCollatorForSeq2Seq(tok, model=model),
-)
-trainer.train()
-trainer.save_model("models/t5_neutralizer")
-tok.save_pretrained("models/t5_neutralizer")
 
-# 3. Inference with sensible decoding settings
-def neutralize(text):
-    inputs = tok(PREFIX + text, return_tensors="pt", truncation=True, max_length=64).to(model.device)
-    out = model.generate(
-        **inputs,
-        num_beams=5,
-        no_repeat_ngram_size=3,
-        max_new_tokens=64,
-        early_stopping=True,
+def train():
+    train_ds, val_ds = prepare_dataset()
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
+    model = AutoModelForSeq2SeqLM.from_pretrained(MODEL_NAME)
+    model.config.tie_word_embeddings = False
+
+    def preprocess(batch):
+        model_inputs = tokenizer(batch["input_text"], max_length=MAX_SOURCE_LEN, truncation=True)
+        labels = tokenizer(text_target=batch["target_text"], max_length=MAX_TARGET_LEN, truncation=True)
+        model_inputs["labels"] = labels["input_ids"]
+        return model_inputs
+
+    tokenized_train = train_ds.map(preprocess, batched=True, remove_columns=train_ds.column_names)
+    tokenized_val = val_ds.map(preprocess, batched=True, remove_columns=val_ds.column_names)
+
+    use_cuda = torch.cuda.is_available()
+
+    args = Seq2SeqTrainingArguments(
+        output_dir=str(OUTPUT_DIR),
+        learning_rate=2.5e-4,
+        per_device_train_batch_size=8,
+        per_device_eval_batch_size=8,
+        gradient_accumulation_steps=2,
+        num_train_epochs=2,
+        eval_strategy="epoch",
+        save_strategy="epoch",
+        load_best_model_at_end=True,
+        metric_for_best_model="eval_loss",
+        greater_is_better=False,
+        save_total_limit=1,
+        logging_steps=50,
+        report_to="none",
+        fp16=use_cuda,
     )
-    return tok.decode(out[0], skip_special_tokens=True)
+
+    trainer = Seq2SeqTrainer(
+        model=model,
+        args=args,
+        train_dataset=tokenized_train,
+        eval_dataset=tokenized_val,
+        data_collator=DataCollatorForSeq2Seq(tokenizer, model=model),
+    )
+
+    trainer.train()
+    trainer.save_model(str(OUTPUT_DIR))
+    tokenizer.save_pretrained(str(OUTPUT_DIR))
+    print(f"Fine-tuned constructive T5 model successfully saved to: {OUTPUT_DIR}")
+
 
 if __name__ == "__main__":
-    for s in ds["test"]["toxic"][:5]:
-        print("IN :", s)
-        print("OUT:", neutralize(s), "\n")
+    train()
